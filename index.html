@@ -1,4 +1,4 @@
-<!DOCTYPE html>
+
 <html lang="es">
 <head>
     <meta charset="UTF-8">
@@ -267,7 +267,7 @@ const USUARIOS = {
 
 // ── Google Sheets ───────────────────────────────────────────────────────────
 const SHEET_ID    = '1IqkDZ9dnm_f_8WjUleAXoKAWytuz2WHxbWCc6Qqs4WQ';
-const WEB_APP_URL = 'https://script.google.com/macros/s/AKfycbyvSzlVSr-HiyxrMMI8uRmTx6EolIENiUzaJ0ohKNAYgq0NryyGCwuDoHCh8rApFP7r/exec';
+const WEB_APP_URL = 'https://script.google.com/macros/s/AKfycbxErW-8sCzUPV7LglEwrJi79O77Ubow9W84KDHeGSbJRy960UW5YsZcm6FcKI1jBlZeyQ/exec';
 const BASE_URL    = `https://docs.google.com/spreadsheets/d/${SHEET_ID}/gviz/tq?tqx=out:json&sheet=`;
 
 // ── Estado global ───────────────────────────────────────────────────────────
@@ -349,49 +349,50 @@ async function leerSheets() {
     }
 }
 
-// ── Guardar en Google Sheets vía Apps Script ────────────────────────────────
-// Se mantiene GET + iframe para evitar problemas de CORS y no modificar el front.
-function postSheet(payload) {
-    return new Promise(resolve => {
-        let iframe = null;
-        let terminado = false;
+// ── Guardar en Google Sheets mediante JSONP ─────────────────────────────────
+// JSONP permite leer la respuesta de Apps Script desde GitHub Pages sin CORS.
+let jsonpCounter = 0;
 
-        const finalizar = ok => {
+function postSheet(payload, timeoutMs = 15000) {
+    return new Promise(resolve => {
+        const callbackName = '__repartoCallback_' + Date.now() + '_' + (++jsonpCounter);
+        const script = document.createElement('script');
+        let terminado = false;
+        const timer = setTimeout(() => finalizar(false, 'Tiempo de espera agotado al comunicarse con Google Apps Script.'), timeoutMs);
+
+        function limpiar() {
+            clearTimeout(timer);
+            delete window[callbackName];
+            if (script.parentNode) script.parentNode.removeChild(script);
+        }
+
+        function finalizar(ok, error = '') {
             if (terminado) return;
             terminado = true;
-            if (iframe && iframe.parentNode) iframe.parentNode.removeChild(iframe);
-            resolve(ok);
+            limpiar();
+            resolve({ ok, error });
+        }
+
+        window[callbackName] = response => {
+            if (response && response.success) {
+                finalizar(true, '');
+            } else {
+                finalizar(false, response?.error || response?.message || 'Google Apps Script rechazó la operación.');
+            }
         };
+
+        script.onerror = () => finalizar(false, 'No fue posible cargar la respuesta de Google Apps Script.');
 
         try {
             const params = new URLSearchParams({
                 data: JSON.stringify(payload),
+                callback: callbackName,
                 _: String(Date.now())
             });
-
-            iframe = document.createElement('iframe');
-            iframe.style.display = 'none';
-            iframe.setAttribute('aria-hidden', 'true');
-
-            iframe.onload = () => {
-                // Apps Script puede redirigir antes de responder; onload indica
-                // que la petición GET fue aceptada. La validación real se hace
-                // con la recarga posterior desde Google Sheets.
-                setTimeout(() => finalizar(true), 300);
-            };
-
-            iframe.onerror = () => finalizar(false);
-            iframe.src = WEB_APP_URL + '?' + params.toString();
-            document.body.appendChild(iframe);
-
-            // Evita dejar iframes ocultos si la respuesta tarda demasiado.
-            setTimeout(() => {
-                if (!terminado) finalizar(true);
-            }, 10000);
-
+            script.src = WEB_APP_URL + '?' + params.toString();
+            document.head.appendChild(script);
         } catch (e) {
-            console.error('postSheet:', e);
-            finalizar(false);
+            finalizar(false, e.message || String(e));
         }
     });
 }
@@ -493,6 +494,7 @@ function renderHistorial() {
 async function doAsignar() {
     const cui = $('inp-cui')?.value?.trim();
     if (!cui) { alert('Por favor ingrese el CUI de la audiencia'); return; }
+    if (!/^\d{21}$/.test(cui)) { alert('El CUI debe contener exactamente 21 dígitos.'); return; }
     const sig = calcularSiguiente();
     if (!sig) return;
 
@@ -505,6 +507,7 @@ async function doAsignar() {
         : 0;
 
     const nueva = {
+        id:               sig.id,
         audienciaNum:    ultimoNum + 1,
         fecha:           new Date().toLocaleString('es-CO', {year:'numeric',month:'2-digit',day:'2-digit',hour:'2-digit',minute:'2-digit'}),
         juzgado:         sig.nombre,
@@ -512,18 +515,23 @@ async function doAsignar() {
         nuevasAudiencias: sig.audiencias + 1
     };
 
-    // Actualizar estado local inmediatamente
-    state.historial.unshift(nueva);
-    const jIdx = state.juzgados.findIndex(j => j.id === sig.id);
-    if (jIdx >= 0) state.juzgados[jIdx].audiencias++;
-    renderJuzgados();
+    // El backend es la fuente definitiva: no damos por guardada la audiencia
+    // hasta recibir confirmación real de Apps Script.
+    const resultado = await postSheet({
+        action: 'agregarAudiencia',
+        id: sig.id,
+        juzgado: sig.nombre,
+        tipo: cui,
+        fecha: nueva.fecha
+    });
 
-    const ok = await postSheet({ action:'agregarAudiencia', ...nueva });
-    alert(ok
-        ? `✅ Audiencia asignada a ${sig.nombre} y guardada en Google Sheets`
-        : `⚠️ Audiencia asignada localmente pero puede haber problema al guardar en Sheets.`
-    );
-    setTimeout(recargar, 3000);
+    if (resultado.ok) {
+        alert(`✅ Audiencia asignada a ${sig.nombre} y guardada en Google Sheets`);
+        await recargar();
+    } else {
+        alert(`❌ No se guardó la audiencia.\n\nDetalle: ${resultado.error}`);
+        await recargar();
+    }
 }
 
 // ── Acción: toggle juzgado ───────────────────────────────────────────────────
@@ -555,14 +563,15 @@ async function doToggle(id, estaActivo) {
 
     mostrarGuardando(id, false);
 
-    if (ok) {
+    if (ok.ok) {
         const accion = nuevoEstado ? 'reintegrado' : 'marcado como ausente';
         mostrarToast(`${j.nombre} ${accion} correctamente`);
     } else {
-        mostrarToast('Advertencia: el cambio se reflejó localmente pero puede no haberse guardado en Sheets', true);
+        mostrarToast(`No se pudo guardar el cambio: ${ok.error}`, true);
+        await recargar();
     }
 
-    setTimeout(recargar, 5000);
+    if (ok.ok) setTimeout(recargar, 1500);
 }
 
 // ── Feedback visual guardando ────────────────────────────────────────────────
@@ -601,8 +610,14 @@ async function doAjustar(id, delta) {
     if (!j) return;
     j.audiencias = Math.max(0, j.audiencias + Number(delta));
     renderJuzgados();
-    await postSheet({ action:'actualizarJuzgado', id, audiencias:j.audiencias, activo:j.activo, motivoInactivo:j.motivoInactivo });
-    setTimeout(recargar, 5000);
+    const resultado = await postSheet({ action:'actualizarJuzgado', id, audiencias:j.audiencias, activo:j.activo, motivoInactivo:j.motivoInactivo });
+    if (!resultado.ok) {
+        mostrarToast(`No se pudo guardar el ajuste: ${resultado.error}`, true);
+        await recargar();
+    } else {
+        mostrarToast('Contador actualizado correctamente');
+        setTimeout(recargar, 1500);
+    }
 }
 
 // ── Delegación de eventos en grid ────────────────────────────────────────────
@@ -725,4 +740,3 @@ if (yaAuth && yaUser) {
 }
 </script>
 </body>
-</html>
