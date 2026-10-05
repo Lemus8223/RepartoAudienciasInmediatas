@@ -349,19 +349,29 @@ async function leerSheets() {
     }
 }
 
-// ── POST a Apps Script ───────────────────────────────────────────────────────
-async function postSheet(payload) {
-    try {
-        await fetch(WEB_APP_URL, {
-            method: 'POST', mode: 'no-cors',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify(payload)
-        });
-        return true;
-    } catch(e) {
-        console.error('postSheet:', e);
-        return false;
-    }
+// ── POST a Apps Script via iframe GET (sin bloqueo CORS) ────────────────────
+function postSheet(payload) {
+    return new Promise(resolve => {
+        try {
+            const params = new URLSearchParams({ data: JSON.stringify(payload) });
+            const url = WEB_APP_URL + '?' + params.toString();
+            const iframe = document.createElement('iframe');
+            iframe.style.display = 'none';
+            iframe.src = url;
+            iframe.onload  = () => { document.body.removeChild(iframe); resolve(true); };
+            iframe.onerror = () => { document.body.removeChild(iframe); resolve(false); };
+            document.body.appendChild(iframe);
+            setTimeout(() => {
+                if (document.body.contains(iframe)) {
+                    document.body.removeChild(iframe);
+                    resolve(true);
+                }
+            }, 6000);
+        } catch(e) {
+            console.error('postSheet:', e);
+            resolve(false);
+        }
+    });
 }
 
 // ── Calcular siguiente juzgado ───────────────────────────────────────────────
@@ -498,17 +508,69 @@ async function doAsignar() {
 async function doToggle(id, estaActivo) {
     const j = state.juzgados.find(x => x.id == id);
     if (!j) return;
+
     let motivo = '';
     if (estaActivo === 'true') {
-        motivo = prompt('Motivo de ausencia (permiso/incapacidad/compensatorio):');
-        if (!motivo) return;
+        motivo = prompt('Motivo de ausencia:\n(permiso / incapacidad / compensatorio / otro)');
+        if (motivo === null || motivo.trim() === '') return;
+        motivo = motivo.trim();
     }
-    const nuevoEstado = estaActivo !== 'true';
+
+    const nuevoEstado = (estaActivo !== 'true');
     j.activo = nuevoEstado;
     j.motivoInactivo = nuevoEstado ? '' : motivo;
+
     renderJuzgados();
-    await postSheet({ action:'actualizarJuzgado', id, audiencias:j.audiencias, activo:nuevoEstado, motivoInactivo:j.motivoInactivo });
-    setTimeout(recargar, 2000);
+    mostrarGuardando(id, true);
+
+    const ok = await postSheet({
+        action: 'actualizarJuzgado',
+        id,
+        audiencias:    j.audiencias,
+        activo:        nuevoEstado,
+        motivoInactivo: j.motivoInactivo
+    });
+
+    mostrarGuardando(id, false);
+
+    if (ok) {
+        const accion = nuevoEstado ? 'reintegrado' : 'marcado como ausente';
+        mostrarToast(`${j.nombre} ${accion} correctamente`);
+    } else {
+        mostrarToast('Advertencia: el cambio se reflejó localmente pero puede no haberse guardado en Sheets', true);
+    }
+
+    setTimeout(recargar, 5000);
+}
+
+// ── Feedback visual guardando ────────────────────────────────────────────────
+function mostrarGuardando(id, activo) {
+    const btn = document.querySelector(`[data-id="${id}"][data-activo]`);
+    if (!btn) return;
+    if (activo) {
+        btn.disabled = true;
+        btn.textContent = '💾 Guardando...';
+        btn.style.opacity = '0.6';
+    } else {
+        btn.disabled = false;
+        btn.style.opacity = '1';
+    }
+}
+
+function mostrarToast(msg, esError = false) {
+    let t = document.getElementById('toast-msg');
+    if (!t) {
+        t = document.createElement('div');
+        t.id = 'toast-msg';
+        t.style.cssText = 'position:fixed;bottom:1.5rem;left:50%;transform:translateX(-50%);padding:.75rem 1.5rem;border-radius:.5rem;font-size:.875rem;font-weight:500;z-index:9999;max-width:90vw;text-align:center;box-shadow:0 4px 12px rgba(0,0,0,.2);transition:opacity .3s';
+        document.body.appendChild(t);
+    }
+    t.textContent = msg;
+    t.style.background = esError ? '#dc2626' : '#16a34a';
+    t.style.color = '#fff';
+    t.style.opacity = '1';
+    clearTimeout(t._tid);
+    t._tid = setTimeout(() => { t.style.opacity = '0'; }, 3500);
 }
 
 // ── Acción: ajustar audiencias ───────────────────────────────────────────────
@@ -518,7 +580,7 @@ async function doAjustar(id, delta) {
     j.audiencias = Math.max(0, j.audiencias + Number(delta));
     renderJuzgados();
     await postSheet({ action:'actualizarJuzgado', id, audiencias:j.audiencias, activo:j.activo, motivoInactivo:j.motivoInactivo });
-    setTimeout(recargar, 2000);
+    setTimeout(recargar, 5000);
 }
 
 // ── Delegación de eventos en grid ────────────────────────────────────────────
