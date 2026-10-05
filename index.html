@@ -349,51 +349,41 @@ async function leerSheets() {
     }
 }
 
-// ── Guardar en Google Sheets mediante JSONP ─────────────────────────────────
-// JSONP permite leer la respuesta de Apps Script desde GitHub Pages sin CORS.
-let jsonpCounter = 0;
-
-function postSheet(payload, timeoutMs = 15000) {
+// ── Guardar en Apps Script mediante JSONP ───────────────────────────────────
+// Compatible con GitHub Pages: no depende de CORS/fetch para escribir.
+function postSheet(payload) {
     return new Promise(resolve => {
-        const callbackName = '__repartoCallback_' + Date.now() + '_' + (++jsonpCounter);
+        const callbackName = '__appsScriptCallback_' + Date.now() + '_' + Math.floor(Math.random() * 100000);
         const script = document.createElement('script');
         let terminado = false;
-        const timer = setTimeout(() => finalizar(false, 'Tiempo de espera agotado al comunicarse con Google Apps Script.'), timeoutMs);
+        const timeoutId = setTimeout(() => finalizar(false, 'Tiempo de espera agotado'), 15000);
 
-        function limpiar() {
-            clearTimeout(timer);
-            delete window[callbackName];
-            if (script.parentNode) script.parentNode.removeChild(script);
-        }
-
-        function finalizar(ok, error = '') {
+        function finalizar(ok, detalle) {
             if (terminado) return;
             terminado = true;
-            limpiar();
-            resolve({ ok, error });
+            clearTimeout(timeoutId);
+            try { delete window[callbackName]; } catch (_) {}
+            if (script.parentNode) script.parentNode.removeChild(script);
+            if (!ok) console.error('postSheet:', detalle || 'Sin respuesta');
+            resolve(ok);
         }
 
-        window[callbackName] = response => {
-            if (response && response.success) {
-                finalizar(true, '');
+        window[callbackName] = function(respuesta) {
+            if (respuesta && respuesta.success === true) {
+                finalizar(true);
             } else {
-                finalizar(false, response?.error || response?.message || 'Google Apps Script rechazó la operación.');
+                finalizar(false, respuesta && (respuesta.error || respuesta.message));
             }
         };
 
-        script.onerror = () => finalizar(false, 'No fue posible cargar la respuesta de Google Apps Script.');
+        script.onerror = () => finalizar(false, 'No fue posible cargar la respuesta de Google Apps Script');
 
-        try {
-            const params = new URLSearchParams({
-                data: JSON.stringify(payload),
-                callback: callbackName,
-                _: String(Date.now())
-            });
-            script.src = WEB_APP_URL + '?' + params.toString();
-            document.head.appendChild(script);
-        } catch (e) {
-            finalizar(false, e.message || String(e));
-        }
+        const params = new URLSearchParams();
+        params.set('data', JSON.stringify(payload));
+        params.set('callback', callbackName);
+        params.set('_', Date.now().toString());
+        script.src = WEB_APP_URL + '?' + params.toString();
+        document.body.appendChild(script);
     });
 }
 
@@ -494,7 +484,6 @@ function renderHistorial() {
 async function doAsignar() {
     const cui = $('inp-cui')?.value?.trim();
     if (!cui) { alert('Por favor ingrese el CUI de la audiencia'); return; }
-    if (!/^\d{21}$/.test(cui)) { alert('El CUI debe contener exactamente 21 dígitos.'); return; }
     const sig = calcularSiguiente();
     if (!sig) return;
 
@@ -507,31 +496,26 @@ async function doAsignar() {
         : 0;
 
     const nueva = {
-        id:               sig.id,
         audienciaNum:    ultimoNum + 1,
         fecha:           new Date().toLocaleString('es-CO', {year:'numeric',month:'2-digit',day:'2-digit',hour:'2-digit',minute:'2-digit'}),
-        juzgado:         sig.nombre,
-        tipo:            cui,
-        nuevasAudiencias: sig.audiencias + 1
+        id:               sig.id,
+        juzgado:           sig.nombre,
+        tipo:              cui,
+        nuevasAudiencias:  sig.audiencias + 1
     };
 
-    // El backend es la fuente definitiva: no damos por guardada la audiencia
-    // hasta recibir confirmación real de Apps Script.
-    const resultado = await postSheet({
-        action: 'agregarAudiencia',
-        id: sig.id,
-        juzgado: sig.nombre,
-        tipo: cui,
-        fecha: nueva.fecha
-    });
+    // Actualizar estado local inmediatamente
+    state.historial.unshift(nueva);
+    const jIdx = state.juzgados.findIndex(j => j.id === sig.id);
+    if (jIdx >= 0) state.juzgados[jIdx].audiencias++;
+    renderJuzgados();
 
-    if (resultado.ok) {
-        alert(`✅ Audiencia asignada a ${sig.nombre} y guardada en Google Sheets`);
-        await recargar();
-    } else {
-        alert(`❌ No se guardó la audiencia.\n\nDetalle: ${resultado.error}`);
-        await recargar();
-    }
+    const ok = await postSheet({ action:'agregarAudiencia', ...nueva });
+    alert(ok
+        ? `✅ Audiencia asignada a ${sig.nombre} y guardada en Google Sheets`
+        : `⚠️ Audiencia asignada localmente pero puede haber problema al guardar en Sheets.`
+    );
+    setTimeout(recargar, 3000);
 }
 
 // ── Acción: toggle juzgado ───────────────────────────────────────────────────
@@ -563,15 +547,14 @@ async function doToggle(id, estaActivo) {
 
     mostrarGuardando(id, false);
 
-    if (ok.ok) {
+    if (ok) {
         const accion = nuevoEstado ? 'reintegrado' : 'marcado como ausente';
         mostrarToast(`${j.nombre} ${accion} correctamente`);
     } else {
-        mostrarToast(`No se pudo guardar el cambio: ${ok.error}`, true);
-        await recargar();
+        mostrarToast('Advertencia: el cambio se reflejó localmente pero puede no haberse guardado en Sheets', true);
     }
 
-    if (ok.ok) setTimeout(recargar, 1500);
+    setTimeout(recargar, 5000);
 }
 
 // ── Feedback visual guardando ────────────────────────────────────────────────
@@ -610,14 +593,8 @@ async function doAjustar(id, delta) {
     if (!j) return;
     j.audiencias = Math.max(0, j.audiencias + Number(delta));
     renderJuzgados();
-    const resultado = await postSheet({ action:'actualizarJuzgado', id, audiencias:j.audiencias, activo:j.activo, motivoInactivo:j.motivoInactivo });
-    if (!resultado.ok) {
-        mostrarToast(`No se pudo guardar el ajuste: ${resultado.error}`, true);
-        await recargar();
-    } else {
-        mostrarToast('Contador actualizado correctamente');
-        setTimeout(recargar, 1500);
-    }
+    await postSheet({ action:'actualizarJuzgado', id, audiencias:j.audiencias, activo:j.activo, motivoInactivo:j.motivoInactivo });
+    setTimeout(recargar, 5000);
 }
 
 // ── Delegación de eventos en grid ────────────────────────────────────────────
