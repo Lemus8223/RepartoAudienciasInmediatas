@@ -349,27 +349,49 @@ async function leerSheets() {
     }
 }
 
-// ── POST a Apps Script via iframe GET (sin bloqueo CORS) ────────────────────
+// ── Guardar en Google Sheets vía Apps Script ────────────────────────────────
+// Se mantiene GET + iframe para evitar problemas de CORS y no modificar el front.
 function postSheet(payload) {
     return new Promise(resolve => {
+        let iframe = null;
+        let terminado = false;
+
+        const finalizar = ok => {
+            if (terminado) return;
+            terminado = true;
+            if (iframe && iframe.parentNode) iframe.parentNode.removeChild(iframe);
+            resolve(ok);
+        };
+
         try {
-            const params = new URLSearchParams({ data: JSON.stringify(payload) });
-            const url = WEB_APP_URL + '?' + params.toString();
-            const iframe = document.createElement('iframe');
+            const params = new URLSearchParams({
+                data: JSON.stringify(payload),
+                _: String(Date.now())
+            });
+
+            iframe = document.createElement('iframe');
             iframe.style.display = 'none';
-            iframe.src = url;
-            iframe.onload  = () => { document.body.removeChild(iframe); resolve(true); };
-            iframe.onerror = () => { document.body.removeChild(iframe); resolve(false); };
+            iframe.setAttribute('aria-hidden', 'true');
+
+            iframe.onload = () => {
+                // Apps Script puede redirigir antes de responder; onload indica
+                // que la petición GET fue aceptada. La validación real se hace
+                // con la recarga posterior desde Google Sheets.
+                setTimeout(() => finalizar(true), 300);
+            };
+
+            iframe.onerror = () => finalizar(false);
+            iframe.src = WEB_APP_URL + '?' + params.toString();
             document.body.appendChild(iframe);
+
+            // Evita dejar iframes ocultos si la respuesta tarda demasiado.
             setTimeout(() => {
-                if (document.body.contains(iframe)) {
-                    document.body.removeChild(iframe);
-                    resolve(true);
-                }
-            }, 6000);
-        } catch(e) {
+                if (!terminado) finalizar(true);
+            }, 10000);
+
+        } catch (e) {
             console.error('postSheet:', e);
-            resolve(false);
+            finalizar(false);
         }
     });
 }
