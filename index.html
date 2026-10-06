@@ -349,40 +349,56 @@ async function leerSheets() {
     }
 }
 
-// ── Guardar en Apps Script mediante JSONP ───────────────────────────────────
-// Compatible con GitHub Pages: no depende de CORS/fetch para escribir.
+// ── Comunicación con Apps Script mediante JSONP ─────────────────────────────
+// Se usa <script> en lugar de fetch/iframe porque GitHub Pages y Apps Script
+// están en dominios diferentes. Apps Script debe estar desplegado como Web App
+// y ejecutar la versión que contiene respuestaJSONP_().
 function postSheet(payload) {
     return new Promise(resolve => {
-        const callbackName = '__appsScriptCallback_' + Date.now() + '_' + Math.floor(Math.random() * 100000);
+        const callbackName = 'gsCallback_' + Date.now() + '_' + Math.floor(Math.random() * 100000);
         const script = document.createElement('script');
-        let terminado = false;
-        const timeoutId = setTimeout(() => finalizar(false, 'Tiempo de espera agotado'), 15000);
+        let finalizado = false;
 
-        function finalizar(ok, detalle) {
-            if (terminado) return;
-            terminado = true;
-            clearTimeout(timeoutId);
-            try { delete window[callbackName]; } catch (_) {}
+        const limpiar = () => {
             if (script.parentNode) script.parentNode.removeChild(script);
-            if (!ok) console.error('postSheet:', detalle || 'Sin respuesta');
-            resolve(ok);
-        }
+            try { delete window[callbackName]; } catch (_) { window[callbackName] = undefined; }
+        };
 
-        window[callbackName] = function(respuesta) {
+        const finalizar = (resultado) => {
+            if (finalizado) return;
+            finalizado = true;
+            clearTimeout(temporizador);
+            limpiar();
+            resolve(resultado);
+        };
+
+        const temporizador = setTimeout(() => {
+            console.error('Apps Script: tiempo de espera agotado.');
+            finalizar(false);
+        }, 15000);
+
+        window[callbackName] = (respuesta) => {
+            console.log('Respuesta Apps Script:', respuesta);
             if (respuesta && respuesta.success === true) {
                 finalizar(true);
             } else {
-                finalizar(false, respuesta && (respuesta.error || respuesta.message));
+                console.error('Apps Script devolvió un error:', respuesta);
+                finalizar(false);
             }
         };
 
-        script.onerror = () => finalizar(false, 'No fue posible cargar la respuesta de Google Apps Script');
+        const params = new URLSearchParams({
+            data: JSON.stringify(payload),
+            callback: callbackName,
+            _: String(Date.now())
+        });
 
-        const params = new URLSearchParams();
-        params.set('data', JSON.stringify(payload));
-        params.set('callback', callbackName);
-        params.set('_', Date.now().toString());
         script.src = WEB_APP_URL + '?' + params.toString();
+        script.onerror = () => {
+            console.error('No fue posible cargar la respuesta de Google Apps Script.');
+            finalizar(false);
+        };
+
         document.body.appendChild(script);
     });
 }
@@ -499,9 +515,9 @@ async function doAsignar() {
         audienciaNum:    ultimoNum + 1,
         fecha:           new Date().toLocaleString('es-CO', {year:'numeric',month:'2-digit',day:'2-digit',hour:'2-digit',minute:'2-digit'}),
         id:               sig.id,
-        juzgado:           sig.nombre,
-        tipo:              cui,
-        nuevasAudiencias:  sig.audiencias + 1
+        juzgado:         sig.nombre,
+        tipo:            cui,
+        nuevasAudiencias: sig.audiencias + 1
     };
 
     // Actualizar estado local inmediatamente
@@ -718,4 +734,3 @@ if (yaAuth && yaUser) {
 </script>
 </body>
 </html>
-
